@@ -11,7 +11,8 @@ from typing import Any, Awaitable, Callable, Optional
 from permissions import Identity
 
 
-Handler = Callable[[dict[str, Any], Identity], Awaitable[dict[str, Any]]]
+RequestHandler = Callable[[dict[str, Any], Identity], Awaitable[dict[str, Any]]]
+SubscribeHandler = Callable[[dict[str, Any], Identity, asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -20,9 +21,10 @@ class IPCConfig:
 
 
 class IPCServer:
-    def __init__(self, cfg: IPCConfig, handler: Handler) -> None:
+    def __init__(self, cfg: IPCConfig, handler: RequestHandler, subscribe_handler: SubscribeHandler) -> None:
         self._cfg = cfg
         self._handler = handler
+        self._subscribe_handler = subscribe_handler
         self._server: asyncio.base_events.Server | None = None
 
     async def start(self) -> None:
@@ -45,7 +47,9 @@ class IPCServer:
         ident = self._get_peer_identity(writer)
         try:
             # Protocol: newline-delimited JSON objects.
-            # One request -> one response.
+            # Two modes:
+            #   - request/response (default): one request -> one response -> close
+            #   - subscription: command == "subscribe" -> keep connection open and stream events
             line = await reader.readline()
             if not line:
                 return
@@ -57,6 +61,10 @@ class IPCServer:
 
             if not isinstance(req, dict):
                 await self._write(writer, {"ok": False, "error": "invalid_request: expected object"})
+                return
+
+            if req.get("command") == "subscribe":
+                await self._subscribe_handler(req, ident, reader, writer)
                 return
 
             resp = await self._handler(req, ident)

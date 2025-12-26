@@ -33,6 +33,21 @@ def _call_engine(command: str, args: list[Any], *, request_id: str | None = None
         line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
         return json.loads(line) if line else {"ok": False, "error": "no_response"}
 
+def _subscribe(patterns: list[str] | None = None, *, last_event_id: int | None = None) -> tuple[socket.socket, Any]:
+    """
+    Opens a long-lived subscription connection.
+    Returns (socket, fileobj) where fileobj yields newline-delimited JSON frames.
+    """
+    req: dict[str, Any] = {"command": "subscribe", "args": patterns or ["*"]}
+    if last_event_id is not None:
+        req["last_event_id"] = int(last_event_id)
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(_sock_path())
+    s.sendall((json.dumps(req, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+    f = s.makefile("r", encoding="utf-8", newline="\n")
+    return s, f
+
 
 def _print(obj: Any, *, as_json: bool) -> None:
     if as_json:
@@ -54,7 +69,7 @@ def main() -> int:
 
     p_build = sp.add_parser("build")
     p_build.add_argument("args", nargs=argparse.REMAINDER)
-    p_build.add_argument("--follow", action="store_true", help="Poll until job completes")
+    p_build.add_argument("--follow", action="store_true", help="Follow job updates (engine subscription; fallback: polling)")
     p_build.add_argument("--poll", type=float, default=0.25, help="Poll interval seconds")
 
     p_jobs = sp.add_parser("jobs")
@@ -79,15 +94,77 @@ def main() -> int:
             return 0 if resp.get("ok") else 2
 
         if args.cmd == "build":
+            sub_sock = None
+            sub_file = None
+            if args.follow:
+                try:
+                    # Subscribe first so we can't miss fast jobs.
+                    sub_sock, sub_file = _subscribe(["job.*", "engine.shutdown.*", "command.*"])
+                    first = sub_file.readline()
+                    ack = json.loads(first) if first else {"ok": False, "error": "no_subscribe_ack"}
+                    if not ack.get("ok") or ack.get("type") != "subscribed":
+                        try:
+                            sub_sock.close()
+                        except Exception:
+                            pass
+                        sub_sock = None
+                        sub_file = None
+                except Exception:
+                    sub_sock = None
+                    sub_file = None
+
             resp = _call_engine("build", list(args.args))
             _print(resp, as_json=args.json)
             if not resp.get("ok"):
+                if sub_sock:
+                    try:
+                        sub_sock.close()
+                    except Exception:
+                        pass
                 return 2
+
             if not args.follow:
                 return 0
+
             job_id = (resp.get("result") or {}).get("job_id")
             if not isinstance(job_id, int):
+                if sub_sock:
+                    try:
+                        sub_sock.close()
+                    except Exception:
+                        pass
                 return 0
+
+            # Event-driven follow (preferred)
+            if sub_file is not None:
+                try:
+                    while True:
+                        line = sub_file.readline()
+                        if not line:
+                            break
+                        msg = json.loads(line)
+                        if msg.get("type") != "event":
+                            continue
+                        ev = msg.get("event") or {}
+                        ev_type = ev.get("type")
+                        payload = ev.get("payload") or {}
+                        if payload.get("job_id") != job_id:
+                            continue
+                        if ev_type in ("job.created", "job.started"):
+                            _print({"event": ev}, as_json=args.json)
+                        if ev_type in ("job.finished", "job.failed"):
+                            # Fetch final job record for authoritative status/result.
+                            jobs = _call_engine("jobs", [200]).get("result", {}).get("jobs", [])
+                            job = next((x for x in jobs if x.get("id") == job_id), None)
+                            _print({"job": job, "terminal_event": ev}, as_json=args.json)
+                            return 0 if (job or {}).get("status") == "completed" else 2
+                finally:
+                    try:
+                        sub_sock.close()
+                    except Exception:
+                        pass
+
+            # Fallback polling
             while True:
                 j = _call_engine("jobs", [200]).get("result", {}).get("jobs", [])
                 job = next((x for x in j if x.get("id") == job_id), None)

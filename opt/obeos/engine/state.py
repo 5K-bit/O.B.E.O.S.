@@ -222,6 +222,45 @@ class StateStore:
             event_id = int(cur.lastrowid)
         return Event(id=event_id, timestamp=timestamp, source=source, type=type_, payload=payload)
 
+    def get_last_event_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events;").fetchone()
+            return int(row["m"])
+
+    def list_events_after_id(
+        self,
+        *,
+        last_event_id: int,
+        limit: int = 1000,
+        type_: Optional[str] = None,
+    ) -> list[Event]:
+        """
+        Replay model: strictly forward, strictly monotonic by id.
+        Returns events with id > last_event_id, in ascending order.
+        """
+        clauses: list[str] = ["id > ?"]
+        params: list[Any] = [int(last_event_id)]
+        if type_ is not None:
+            clauses.append("type = ?")
+            params.append(type_)
+        where = f"WHERE {' AND '.join(clauses)}"
+        params.append(int(limit))
+        sql = f"SELECT * FROM events {where} ORDER BY id ASC LIMIT ?;"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        out: list[Event] = []
+        for r in rows:
+            out.append(
+                Event(
+                    id=int(r["id"]),
+                    timestamp=float(r["ts"]),
+                    source=str(r["source"]),
+                    type=str(r["type"]),
+                    payload=_json_loads(r["payload"]),
+                )
+            )
+        return out
+
     def list_events(
         self,
         *,
