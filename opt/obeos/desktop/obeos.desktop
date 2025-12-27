@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=OBEOS Console
+Exec=/opt/obeos/desktop/console.py
+Icon=utilities-terminal
+Terminal=false
+Categories=System;

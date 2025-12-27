@@ -1,0 +1,16 @@
+engine:
+  # For production, leave this as /run/obeos.sock
+  # For local development, override via OBEOS_SOCKET=/tmp/obeos.sock
+  socket_path: /run/obeos.sock
+
+  # SQLite file path relative to OBEOS_ROOT (/opt/obeos by default).
+  db_path: storage/obeos.db
+
+  heartbeat_interval_sec: 2.0
+
+modules:
+  enabled:
+    - build
+    - control
+    - observe
+    - memory
